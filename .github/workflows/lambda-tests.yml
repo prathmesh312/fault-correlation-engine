@@ -1,0 +1,52 @@
+name: Lambda Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-enrichment:
+    name: Enrichment Lambda tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r lambda/enrichment/requirements.txt
+          pip install pytest moto boto3
+
+      - name: Run enrichment tests
+        run: pytest lambda/enrichment/tests/ -v --tb=short
+
+  test-alerting:
+    name: Alerting Lambda tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r lambda/alerting/requirements.txt
+          pip install pytest moto boto3
+
+      - name: Run alerting tests
+        run: pytest lambda/alerting/tests/ -v --tb=short
