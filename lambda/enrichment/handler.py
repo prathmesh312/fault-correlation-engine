@@ -241,22 +241,6 @@ def handler(event: dict, context) -> dict:
                 "action":    "retrying_batch",
             }))
             raise
-            logger.error(json.dumps({
-                "event":     "record_failed",
-                "device_id": device_id,
-                "error":     str(e),
-                "code":      error_code,
-            }))
-            failed += 1
-            raise  # re-raise so Lambda retries the batch
-
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.error(json.dumps({
-                "event":     "record_parse_failed",
-                "device_id": device_id,
-                "error":     str(e),
-            }))
-            skipped += 1  # malformed record — skip, don't retry
 
     logger.info(json.dumps({
         "event":     "batch_complete",
