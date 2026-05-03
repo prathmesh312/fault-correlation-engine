@@ -1,0 +1,58 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform-apply:
+    name: Terraform apply — ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    environment: production
+
+    strategy:
+      matrix:
+        region: [ap-southeast-2, us-east-1, eu-central-1]
+      max-parallel: 1
+
+    defaults:
+      run:
+        working-directory: terraform/regions/${{ matrix.region }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform apply
+        run: |
+          terraform apply \
+            -var-file="production.tfvars" \
+            -auto-approve
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          aws sns publish \
+            --topic-arn ${{ secrets.OPS_SNS_TOPIC_ARN }} \
+            --message "Terraform apply FAILED for region ${{ matrix.region }} on commit ${{ github.sha }}" \
+            --subject "ALERT: Terraform Apply Failed"
