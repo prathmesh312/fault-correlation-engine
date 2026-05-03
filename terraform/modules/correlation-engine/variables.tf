@@ -72,3 +72,21 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "enable_network_firewall" {
+  description = "Enable AWS Network Firewall for domain-based egress filtering"
+  type        = bool
+  default     = false
+}
+
+variable "allowed_egress_domains" {
+  description = "Domains allowed through Network Firewall"
+  type        = list(string)
+  default     = []
+}
+
+variable "ops_sns_topic_arn" {
+  description = "SNS topic ARN for operational alerts"
+  type        = string
+  default     = ""
+}

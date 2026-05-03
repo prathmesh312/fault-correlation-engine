@@ -1,58 +1,261 @@
-name: Terraform Apply
+name: Terraform Deploy + Lambda Canary
 
 on:
   push:
     branches: [main]
-    paths:
-      - "terraform/**"
 
 permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-southeast-2
+  CANARY_MONITOR_SECS: "300"
+  ERROR_RATE_THRESHOLD: "5"
+
 jobs:
-  terraform-apply:
-    name: Terraform apply — ${{ matrix.region }}
+  test:
+    name: Run all tests
     runs-on: ubuntu-latest
-    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install pytest moto boto3
+      - run: pip install -r lambda/enrichment/requirements.txt -r lambda/alerting/requirements.txt
+      - run: pytest lambda/ -v --tb=short
 
-    strategy:
-      matrix:
-        region: [ap-southeast-2, us-east-1, eu-central-1]
-      max-parallel: 1
-
+  deploy-dev:
+    name: Deploy — dev (auto)
+    needs: test
+    runs-on: ubuntu-latest
+    environment: dev
     defaults:
       run:
-        working-directory: terraform/regions/${{ matrix.region }}
-
+        working-directory: terraform/regions/ap-southeast-2
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.0"
-
-      - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
-          aws-region: ap-southeast-2
-
-      - name: Terraform init
-        run: terraform init
-
-      - name: Terraform apply
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init
+      - run: terraform apply -var-file="dev.tfvars" -auto-approve
+      - name: Record deployment
         run: |
-          terraform apply \
-            -var-file="production.tfvars" \
-            -auto-approve
+          aws cloudwatch put-metric-data \
+            --namespace CICDMetrics \
+            --metric-data MetricName=DeploymentCount,Value=1,Unit=Count \
+            --dimensions Name=Environment,Value=dev
 
-      - name: Notify on failure
+  deploy-staging:
+    name: Deploy — staging (1 approval)
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: staging
+    defaults:
+      run:
+        working-directory: terraform/regions/ap-southeast-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init
+      - run: terraform apply -var-file="staging.tfvars" -auto-approve
+      - name: Validate staging health
+        run: |
+          echo "Waiting 2 minutes for alarms to settle..."
+          sleep 120
+          STATE=$(aws cloudwatch describe-alarms \
+            --alarm-names "fault-correlation-enrichment-errors-staging" \
+            --query 'MetricAlarms[0].StateValue' \
+            --output text 2>/dev/null || echo "OK")
+          if [ "$STATE" = "ALARM" ]; then
+            echo "Staging alarm is ALARM state — blocking production"
+            exit 1
+          fi
+          echo "Staging health check passed: $STATE"
+      - name: Record deployment
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace CICDMetrics \
+            --metric-data MetricName=DeploymentCount,Value=1,Unit=Count \
+            --dimensions Name=Environment,Value=staging
+
+  deploy-production-infra:
+    name: Deploy infrastructure — production (2 approvals)
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: terraform/regions/ap-southeast-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init
+      - run: terraform apply -var-file="production.tfvars" -auto-approve
+
+  canary-enrichment:
+    name: Canary — enrichment Lambda
+    needs: deploy-production-infra
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get current version for rollback
+        run: |
+          OLD_VERSION=$(aws lambda get-alias \
+            --function-name fault-correlation-enrichment-production \
+            --name LIVE \
+            --query 'FunctionVersion' \
+            --output text)
+          echo "OLD_VERSION=$OLD_VERSION" >> $GITHUB_ENV
+          echo "Current version: $OLD_VERSION"
+
+      - name: Package and deploy new Lambda version
+        run: |
+          cd lambda/enrichment
+          pip install -r requirements.txt -t package/ -q
+          cp handler.py package/
+          cd package && zip -r ../enrichment.zip . -q
+          cd ../..
+          aws lambda update-function-code \
+            --function-name fault-correlation-enrichment-production \
+            --zip-file fileb://lambda/enrichment/enrichment.zip
+          aws lambda wait function-updated \
+            --function-name fault-correlation-enrichment-production
+          NEW_VERSION=$(aws lambda publish-version \
+            --function-name fault-correlation-enrichment-production \
+            --description "Commit ${{ github.sha }}" \
+            --query 'Version' --output text)
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+          echo "New version: $NEW_VERSION"
+
+      - name: Start canary — 10% to new version
+        run: |
+          aws lambda update-alias \
+            --function-name fault-correlation-enrichment-production \
+            --name LIVE \
+            --function-version ${{ env.NEW_VERSION }} \
+            --routing-config "{\"AdditionalVersionWeights\":{\"${{ env.OLD_VERSION }}\":0.9}}"
+          echo "Canary: 10% v${{ env.NEW_VERSION }}, 90% v${{ env.OLD_VERSION }}"
+
+      - name: Monitor canary for 5 minutes
+        run: |
+          echo "Monitoring for ${{ env.CANARY_MONITOR_SECS }} seconds..."
+          sleep ${{ env.CANARY_MONITOR_SECS }}
+          START=$(date -u -d "${{ env.CANARY_MONITOR_SECS }} seconds ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null || \
+                  date -u -v-300S +%Y-%m-%dT%H:%M:%S)
+          ERROR_COUNT=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/Lambda \
+            --metric-name Errors \
+            --dimensions \
+              Name=FunctionName,Value=fault-correlation-enrichment-production \
+              Name=Resource,Value="fault-correlation-enrichment-production:LIVE" \
+            --start-time $START \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+            --period ${{ env.CANARY_MONITOR_SECS }} \
+            --statistics Sum \
+            --query 'Datapoints[0].Sum' \
+            --output text 2>/dev/null || echo "0")
+          ERROR_COUNT=${ERROR_COUNT:-0}
+          echo "Errors during canary: $ERROR_COUNT"
+          if [ "$ERROR_COUNT" -gt "${{ env.ERROR_RATE_THRESHOLD }}" ]; then
+            echo "Error count $ERROR_COUNT exceeds threshold ${{ env.ERROR_RATE_THRESHOLD }} — rolling back"
+            exit 1
+          fi
+          echo "Canary healthy"
+
+      - name: Promote to 100% traffic
+        run: |
+          aws lambda update-alias \
+            --function-name fault-correlation-enrichment-production \
+            --name LIVE \
+            --function-version ${{ env.NEW_VERSION }} \
+            --routing-config AdditionalVersionWeights='{}'
+          echo "Promoted v${{ env.NEW_VERSION }} to 100%"
+          aws cloudwatch put-metric-data \
+            --namespace CICDMetrics \
+            --metric-data MetricName=DeploymentCount,Value=1,Unit=Count \
+            --dimensions Name=Environment,Value=production
+
+      - name: Rollback on failure
         if: failure()
         run: |
+          echo "Rolling back to v${{ env.OLD_VERSION }}..."
+          aws lambda update-alias \
+            --function-name fault-correlation-enrichment-production \
+            --name LIVE \
+            --function-version ${{ env.OLD_VERSION }} \
+            --routing-config AdditionalVersionWeights='{}'
+          aws cloudwatch put-metric-data \
+            --namespace CICDMetrics \
+            --metric-data MetricName=RollbackCount,Value=1,Unit=Count \
+            --dimensions Name=Environment,Value=production
           aws sns publish \
             --topic-arn ${{ secrets.OPS_SNS_TOPIC_ARN }} \
-            --message "Terraform apply FAILED for region ${{ matrix.region }} on commit ${{ github.sha }}" \
-            --subject "ALERT: Terraform Apply Failed"
+            --subject "PRODUCTION ROLLBACK — fault-correlation-enrichment" \
+            --message "Canary rolled back to v${{ env.OLD_VERSION }}. Commit: ${{ github.sha }}. Check DLQ and IteratorAge."
+
+  post-deploy-validation:
+    name: Post-deploy — DLQ and IteratorAge check
+    needs: canary-enrichment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check DLQ depth
+        run: |
+          DLQ_DEPTH=$(aws sqs get-queue-attributes \
+            --queue-url ${{ secrets.ENRICHMENT_DLQ_URL }} \
+            --attribute-names ApproximateNumberOfMessages \
+            --query 'Attributes.ApproximateNumberOfMessages' \
+            --output text 2>/dev/null || echo "0")
+          echo "DLQ depth: $DLQ_DEPTH"
+          if [ "$DLQ_DEPTH" -gt "50" ]; then
+            aws sns publish \
+              --topic-arn ${{ secrets.OPS_SNS_TOPIC_ARN }} \
+              --subject "WARNING: High DLQ depth after production deploy" \
+              --message "DLQ depth: $DLQ_DEPTH records. Investigate failed records."
+          fi
+
+      - name: Check IteratorAge
+        run: |
+          sleep 60
+          echo "Checking Kinesis IteratorAge..."
+          ITERATOR_AGE=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/Kinesis \
+            --metric-name GetRecords.IteratorAgeMilliseconds \
+            --dimensions Name=StreamName,Value=network-fault-raw-signals-production \
+            --start-time $(date -u -d '2 minutes ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+            --period 60 \
+            --statistics Maximum \
+            --query 'Datapoints[0].Maximum' \
+            --output text 2>/dev/null || echo "0")
+          echo "IteratorAge: ${ITERATOR_AGE:-0}ms"

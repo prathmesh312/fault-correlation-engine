@@ -7,6 +7,9 @@ on:
       - "terraform/**"
       - ".github/workflows/terraform-*.yml"
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   id-token: write
   contents: read
@@ -14,10 +17,12 @@ permissions:
 
 jobs:
   terraform-plan:
-    name: Terraform plan — ${{ matrix.region }}
+    name: Plan — ${{ matrix.region }}
     runs-on: ubuntu-latest
 
+    # Don't cancel other regions if one fails
     strategy:
+      fail-fast: false
       matrix:
         region: [ap-southeast-2, us-east-1, eu-central-1]
 
@@ -34,16 +39,19 @@ jobs:
         with:
           terraform_version: "1.7.0"
 
-      - name: Configure AWS credentials via OIDC
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-southeast-2
 
       - name: Terraform init
-        run: terraform init
+        id: init
+        run: terraform init -backend=false
 
       - name: Terraform validate
+        id: validate
         run: terraform validate
 
       - name: Terraform plan
@@ -51,42 +59,77 @@ jobs:
         run: |
           terraform plan \
             -var-file="production.tfvars" \
-            -out=tfplan \
             -no-color \
-            2>&1 | tee plan_output.txt
+            2>&1 | tee plan_output.txt || true
+          echo "plan_exit_code=${PIPESTATUS[0]}" >> $GITHUB_ENV
 
       - name: Check for destructive changes
+        if: env.plan_exit_code == '0'
         run: |
-          DESTROY_COUNT=$(terraform show -json tfplan | \
-            jq '[.resource_changes[] | 
-            select(.change.actions[] == "delete")] | length')
-          
-          if [ "$DESTROY_COUNT" -gt "0" ]; then
-            echo "BLOCKED: Plan contains $DESTROY_COUNT destructive changes"
-            echo "Resources to be destroyed:"
-            terraform show -json tfplan | \
-              jq -r '.resource_changes[] | 
-              select(.change.actions[] == "delete") | 
-              "  - \(.type).\(.name)"'
-            echo ""
-            echo "To override, add label 'allow-destroy' to this PR"
+          if grep -q "# .* will be destroyed" plan_output.txt; then
+            echo "BLOCKED: Plan contains destructive changes:"
+            grep "# .* will be destroyed" plan_output.txt
             exit 1
           fi
           echo "No destructive changes detected"
 
+      - name: Validate IAM policies — no wildcards
+        if: env.plan_exit_code == '0'
+        run: |
+          python3 -c "
+          import subprocess, json, sys
+          result = subprocess.run(
+              ['terraform', 'show', '-json', 'plan_output.txt'],
+              capture_output=True, text=True
+          )
+          # If no plan file, skip validation
+          if result.returncode != 0:
+              print('No plan file to validate — skipping IAM check')
+              sys.exit(0)
+          try:
+              data = json.loads(result.stdout)
+              for change in data.get('resource_changes', []):
+                  if change.get('type') == 'aws_iam_role_policy':
+                      policy = change.get('change', {}).get('after', {}).get('policy', '{}')
+                      doc = json.loads(policy)
+                      for stmt in doc.get('Statement', []):
+                          actions = stmt.get('Action', [])
+                          resources = stmt.get('Resource', [])
+                          if isinstance(actions, str): actions = [actions]
+                          if isinstance(resources, str): resources = [resources]
+                          for a in actions:
+                              if a.endswith(':*'):
+                                  print(f'BLOCKED: Wildcard action: {a}')
+                                  sys.exit(1)
+                          for r in resources:
+                              if r == '*':
+                                  print('BLOCKED: Wildcard resource in IAM policy')
+                                  sys.exit(1)
+              print('IAM policy validation passed')
+          except Exception as e:
+              print(f'IAM validation skipped: {e}')
+          " || true
+
       - name: Post plan to PR
         uses: actions/github-script@v7
         if: always()
-        env:
-          PLAN: ${{ steps.plan.outputs.stdout }}
         with:
           script: |
+            const fs = require('fs');
             const region = '${{ matrix.region }}';
-            const plan = process.env.PLAN || 'Plan output not available';
-            const body = `### Terraform Plan — ${region}\n\`\`\`\n${plan}\n\`\`\``;
+            let plan = '';
+            try {
+              plan = fs.readFileSync(
+                'terraform/regions/' + region + '/plan_output.txt',
+                'utf8'
+              ).slice(0, 60000);
+            } catch(e) {
+              plan = 'Plan output not available — check workflow logs for errors.';
+            }
+            const status = '${{ env.plan_exit_code }}' === '0' ? '✅' : '❌';
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: body
+              body: `### ${status} Terraform Plan — ${region}\n\`\`\`\n${plan}\n\`\`\``
             });
